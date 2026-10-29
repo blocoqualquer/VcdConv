@@ -11,6 +11,7 @@ import java.io.BufferedOutputStream
 import java.io.InputStream
 
 class TrackInfo(val number: Int, val audio: Boolean, val fileIdx: Int) {
+    var idx0: Long = -1
     var idx1: Long = -1
 }
 
@@ -50,9 +51,9 @@ class MainActivity : Activity() {
         root.addView(etId)
         etName = EditText(this).apply { hint = "Nome do jogo (máx. 20 caracteres)" }
         root.addView(etName)
-        cbHeader = CheckBox(this).apply { text = "Incluir cabeçalho TOC (estilo cue2pops)"; isChecked = true }
+        cbHeader = CheckBox(this).apply { text = "Incluir cabeçalho POPS (necessário)"; isChecked = true }
         root.addView(cbHeader)
-        cbVmc = CheckBox(this).apply { text = "Gerar SLOT0.VMC (memory card vazio)"; isChecked = true }
+        cbVmc = CheckBox(this).apply { text = "Gerar memory card (pasta com SLOT0/SLOT1.VMC)"; isChecked = true }
         root.addView(cbVmc)
         btnGo = Button(this).apply { text = "2. Converter" }
         root.addView(btnGo)
@@ -140,9 +141,11 @@ class MainActivity : Activity() {
                     tracks.add(cur)
                 }
                 u.startsWith("INDEX") -> {
-                    if (p[1].toInt() == 1 && cur != null) {
+                    val n = p[1].toInt()
+                    if (cur != null && (n == 0 || n == 1)) {
                         val t = p[2].split(":").map { it.toLong() }
-                        cur.idx1 = (t[0] * 60 + t[1]) * 75 + t[2]
+                        val v = (t[0] * 60 + t[1]) * 75 + t[2]
+                        if (n == 1) cur.idx1 = v else cur.idx0 = v
                     }
                 }
             }
@@ -177,6 +180,10 @@ class MainActivity : Activity() {
         b[off] = bcd((f / 75 / 60).toInt())
         b[off + 1] = bcd(((f / 75) % 60).toInt())
         b[off + 2] = bcd((f % 75).toInt())
+    }
+
+    private fun putLe32(b: ByteArray, off: Int, v: Long) {
+        for (k in 0..3) b[off + k] = ((v shr (8 * k)) and 0xFF).toByte()
     }
 
     private fun makeVmc(): ByteArray {
@@ -232,7 +239,8 @@ class MainActivity : Activity() {
             log("ID: $id")
         }
         val name = nameIn.replace(Regex("[^A-Za-z0-9 _.\\-]"), "_").trim().take(20).ifEmpty { "GAME" }
-        val outName = "$id.$name.VCD"
+        val baseName = "$id.$name"
+        val outName = "$baseName.VCD"
 
         val hdr = ByteArray(0x100000)
         if (withHeader) {
@@ -243,13 +251,19 @@ class MainActivity : Activity() {
             hdr[o] = ctl(first); hdr[o + 2] = 0xA0.toByte(); hdr[o + 7] = bcd(first.number); hdr[o + 8] = 0x20; o += 10
             hdr[o] = ctl(last); hdr[o + 2] = 0xA1.toByte(); hdr[o + 7] = bcd(last.number); o += 10
             hdr[o] = ctl(last); hdr[o + 2] = 0xA2.toByte(); putMsf(hdr, o + 7, total); o += 10
-            for (t in tracks) {
+            for ((k, t) in tracks.withIndex()) {
                 hdr[o] = ctl(t); hdr[o + 2] = bcd(t.number)
-                putMsf(hdr, o + 7, starts[t.fileIdx] + t.idx1)
+                val abs1 = starts[t.fileIdx] + t.idx1
+                val abs0 = if (k == 0) -150L else if (t.idx0 >= 0) starts[t.fileIdx] + t.idx0 else abs1
+                putMsf(hdr, o + 3, abs0)
+                putMsf(hdr, o + 7, abs1)
                 o += 10
             }
-        } else if (tracks.size > 1) {
-            log("Aviso: sem cabeçalho, trilhas de áudio não funcionam.")
+            hdr[0x400] = 0x6B; hdr[0x401] = 0x48; hdr[0x402] = 0x6E; hdr[0x403] = 0x22
+            putLe32(hdr, 0x408, total)
+            putLe32(hdr, 0x40C, total)
+        } else {
+            log("Aviso: sem cabeçalho o POPStarter não reconhece o VCD.")
         }
 
         log("Gravando $outName ...")
@@ -278,12 +292,17 @@ class MainActivity : Activity() {
         log("VCD pronto.")
 
         if (makeVmcFile) {
-            if (dir.findFile("SLOT0.VMC") != null) {
-                log("SLOT0.VMC já existe, mantido (seus saves ficam intactos).")
-            } else {
-                val v = createOut(dir, "SLOT0.VMC")
-                (contentResolver.openOutputStream(v.uri, "w") ?: throw Exception("Não abri SLOT0.VMC")).use { it.write(makeVmc()) }
-                log("SLOT0.VMC criado.")
+            val sub = dir.findFile(baseName)?.takeIf { it.isDirectory }
+                ?: dir.createDirectory(baseName)
+                ?: throw Exception("Não consegui criar a pasta $baseName")
+            for (slot in listOf("SLOT0.VMC", "SLOT1.VMC")) {
+                if (sub.findFile(slot) != null) {
+                    log("$baseName/$slot já existe, mantido (seus saves ficam intactos).")
+                } else {
+                    val v = createOut(sub, slot)
+                    (contentResolver.openOutputStream(v.uri, "w") ?: throw Exception("Não abri $slot")).use { it.write(makeVmc()) }
+                    log("$baseName/$slot criado.")
+                }
             }
         }
     }
