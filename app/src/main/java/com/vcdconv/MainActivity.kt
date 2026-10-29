@@ -1,6 +1,7 @@
 package com.vcdconv
 
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.view.View
@@ -21,6 +22,8 @@ class MainActivity : Activity() {
     private lateinit var etName: EditText
     private lateinit var cbHeader: CheckBox
     private lateinit var cbVmc: CheckBox
+    private lateinit var cbMulti: CheckBox
+    private lateinit var cbShare: CheckBox
     private lateinit var btnGo: Button
     private lateinit var bar: ProgressBar
     private lateinit var tvLog: TextView
@@ -55,6 +58,10 @@ class MainActivity : Activity() {
         root.addView(cbHeader)
         cbVmc = CheckBox(this).apply { text = "Gerar memory card (pasta com SLOT0/SLOT1.VMC)"; isChecked = true }
         root.addView(cbVmc)
+        cbMulti = CheckBox(this).apply { text = "Modo multidisco (gera DISCS.TXT, até 4 discos)" }
+        root.addView(cbMulti)
+        cbShare = CheckBox(this).apply { text = "Multidisco: compartilhar o mesmo memory card"; isChecked = true }
+        root.addView(cbShare)
         btnGo = Button(this).apply { text = "2. Converter" }
         root.addView(btnGo)
         bar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply { max = 100 }
@@ -71,29 +78,55 @@ class MainActivity : Activity() {
         }
 
         btnGo.setOnClickListener {
-            val i = spinner.selectedItemPosition
-            if (tree == null || i !in cues.indices) {
+            if (tree == null || cues.isEmpty()) {
                 log("Escolha uma pasta que tenha um arquivo .cue.")
                 return@setOnClickListener
             }
-            val cue = cues[i]
             val idIn = etId.text.toString().trim()
             val nm = etName.text.toString()
             val h = cbHeader.isChecked
             val v = cbVmc.isChecked
-            btnGo.isEnabled = false
-            bar.progress = 0
-            tvLog.text = ""
-            Thread {
-                try {
-                    convert(cue, idIn, nm, h, v)
-                    log("Concluído!")
-                } catch (e: Throwable) {
-                    log("Erro: ${e.message}")
+            val share = cbShare.isChecked
+            if (cbMulti.isChecked) {
+                askDiscs { sel -> start(sel, idIn, nm, h, v, true, share) }
+            } else {
+                val i = spinner.selectedItemPosition
+                if (i !in cues.indices) {
+                    log("Escolha um arquivo .cue.")
+                    return@setOnClickListener
                 }
-                runOnUiThread { btnGo.isEnabled = true }
-            }.start()
+                start(listOf(cues[i]), idIn, nm, h, v, false, share)
+            }
         }
+    }
+
+    private fun askDiscs(onOk: (List<DocumentFile>) -> Unit) {
+        val names = cues.map { it.name ?: "?" }.toTypedArray()
+        val checked = BooleanArray(names.size)
+        AlertDialog.Builder(this)
+            .setTitle("Marque os discos (ordem alfabética, máx. 4)")
+            .setMultiChoiceItems(names, checked) { _, which, isChecked -> checked[which] = isChecked }
+            .setPositiveButton("Converter") { _, _ -> onOk(cues.filterIndexed { i, _ -> checked[i] }) }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    private fun start(
+        sel: List<DocumentFile>, idIn: String, nm: String,
+        h: Boolean, v: Boolean, multi: Boolean, share: Boolean
+    ) {
+        btnGo.isEnabled = false
+        bar.progress = 0
+        tvLog.text = ""
+        Thread {
+            try {
+                convertAll(sel, idIn, nm, h, v, multi, share)
+                log("Concluído!")
+            } catch (e: Throwable) {
+                log("Erro: ${e.message}")
+            }
+            runOnUiThread { btnGo.isEnabled = true }
+        }.start()
     }
 
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
@@ -213,7 +246,68 @@ class MainActivity : Activity() {
         return f
     }
 
-    private fun convert(cue: DocumentFile, idIn: String, nameIn: String, withHeader: Boolean, makeVmcFile: Boolean) {
+    private fun sanitize(s: String, max: Int): String =
+        s.replace(Regex("[^A-Za-z0-9 _.\\-]"), "_").trim().take(max).ifEmpty { "GAME" }
+
+    private fun ensureFolder(dir: DocumentFile, name: String): DocumentFile =
+        dir.findFile(name)?.takeIf { it.isDirectory }
+            ?: dir.createDirectory(name)
+            ?: throw Exception("Não consegui criar a pasta $name")
+
+    private fun putSlots(sub: DocumentFile, label: String) {
+        for (slot in listOf("SLOT0.VMC", "SLOT1.VMC")) {
+            if (sub.findFile(slot) != null) {
+                log("$label/$slot já existe, mantido (seus saves ficam intactos).")
+            } else {
+                val v = createOut(sub, slot)
+                (contentResolver.openOutputStream(v.uri, "w") ?: throw Exception("Não abri $slot")).use { it.write(makeVmc()) }
+                log("$label/$slot criado.")
+            }
+        }
+    }
+
+    private fun writeText(dir: DocumentFile, name: String, text: String) {
+        val f = createOut(dir, name)
+        (contentResolver.openOutputStream(f.uri, "w") ?: throw Exception("Não abri $name"))
+            .use { it.write(text.toByteArray(Charsets.US_ASCII)) }
+    }
+
+    private fun convertAll(
+        sel: List<DocumentFile>, idIn: String, nameIn: String,
+        withHeader: Boolean, makeVmcFile: Boolean, multi: Boolean, share: Boolean
+    ) {
+        val dir = tree ?: throw Exception("Sem pasta")
+        if (!multi) {
+            val name = sanitize(nameIn, 20)
+            val base = convertOne(sel[0], idIn, name, withHeader) { p -> runOnUiThread { bar.progress = p } }
+            if (makeVmcFile) putSlots(ensureFolder(dir, base), base)
+            return
+        }
+        if (sel.size < 2) throw Exception("Marque pelo menos 2 discos.")
+        if (sel.size > 4) throw Exception("O POPStarter troca no máximo 4 discos.")
+        val gname = sanitize(nameIn, 16)
+        val bases = ArrayList<String>()
+        for ((i, c) in sel.withIndex()) {
+            log("--- Disco ${i + 1}: ${c.name} ---")
+            bases.add(
+                convertOne(c, "", "${gname}_CD${i + 1}", withHeader) { p ->
+                    runOnUiThread { bar.progress = (i * 100 + p) / sel.size }
+                }
+            )
+        }
+        val list = bases.joinToString("\r\n") { "$it.VCD" }
+        for ((i, b) in bases.withIndex()) {
+            val sub = ensureFolder(dir, b)
+            writeText(sub, "DISCS.TXT", list)
+            if (share) writeText(sub, "VMCDIR.TXT", bases[0])
+            if (makeVmcFile && (!share || i == 0)) putSlots(sub, b)
+        }
+        log("DISCS.TXT criado em cada pasta de disco.")
+    }
+
+    private fun convertOne(
+        cue: DocumentFile, idIn: String, name: String, withHeader: Boolean, prog: (Int) -> Unit
+    ): String {
         val dir = tree ?: throw Exception("Sem pasta")
         val text = (contentResolver.openInputStream(cue.uri) ?: throw Exception("Não abri o CUE"))
             .use { it.readBytes().toString(Charsets.UTF_8) }.removePrefix("\uFEFF")
@@ -238,7 +332,6 @@ class MainActivity : Activity() {
             id = detectId(bins[0]) ?: throw Exception("Não consegui detectar o ID. Digite manualmente (ex: SLUS_007.76).")
             log("ID: $id")
         }
-        val name = nameIn.replace(Regex("[^A-Za-z0-9 _.\\-]"), "_").trim().take(20).ifEmpty { "GAME" }
         val baseName = "$id.$name"
         val outName = "$baseName.VCD"
 
@@ -284,26 +377,12 @@ class MainActivity : Activity() {
                         os.write(buf, 0, n)
                         done += n
                         val pct = (done * 100 / totalBytes).toInt()
-                        if (pct != lastPct) { lastPct = pct; runOnUiThread { bar.progress = pct } }
+                        if (pct != lastPct) { lastPct = pct; prog(pct) }
                     }
                 }
             }
         }
         log("VCD pronto.")
-
-        if (makeVmcFile) {
-            val sub = dir.findFile(baseName)?.takeIf { it.isDirectory }
-                ?: dir.createDirectory(baseName)
-                ?: throw Exception("Não consegui criar a pasta $baseName")
-            for (slot in listOf("SLOT0.VMC", "SLOT1.VMC")) {
-                if (sub.findFile(slot) != null) {
-                    log("$baseName/$slot já existe, mantido (seus saves ficam intactos).")
-                } else {
-                    val v = createOut(sub, slot)
-                    (contentResolver.openOutputStream(v.uri, "w") ?: throw Exception("Não abri $slot")).use { it.write(makeVmc()) }
-                    log("$baseName/$slot criado.")
-                }
-            }
-        }
+        return baseName
     }
 }
