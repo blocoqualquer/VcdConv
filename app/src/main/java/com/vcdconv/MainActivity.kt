@@ -385,4 +385,149 @@ class MainActivity : Activity() {
         log("VCD pronto.")
         return baseName
     }
+}te()
+        val f = dir.createFile("application/octet-stream", name) ?: throw Exception("Não consegui criar $name")
+        if (f.name != name) f.renameTo(name)
+        return f
+    }
+
+    private fun sanitize(s: String, max: Int): String =
+        s.replace(Regex("[^A-Za-z0-9 _.\\-]"), "_").trim().take(max).ifEmpty { "GAME" }
+
+    private fun ensureFolder(dir: DocumentFile, name: String): DocumentFile =
+        dir.findFile(name)?.takeIf { it.isDirectory }
+            ?: dir.createDirectory(name)
+            ?: throw Exception("Não consegui criar a pasta $name")
+
+    private fun putSlots(sub: DocumentFile, label: String) {
+        for (slot in listOf("SLOT0.VMC", "SLOT1.VMC")) {
+            if (sub.findFile(slot) != null) {
+                log("$label/$slot já existe, mantido (seus saves ficam intactos).")
+            } else {
+                val v = createOut(sub, slot)
+                (contentResolver.openOutputStream(v.uri, "w") ?: throw Exception("Não abri $slot")).use { it.write(makeVmc()) }
+                log("$label/$slot criado.")
+            }
+        }
+    }
+
+    private fun writeText(dir: DocumentFile, name: String, text: String) {
+        val f = createOut(dir, name)
+        (contentResolver.openOutputStream(f.uri, "w") ?: throw Exception("Não abri $name"))
+            .use { it.write(text.toByteArray(Charsets.US_ASCII)) }
+    }
+
+    private fun convertAll(
+        sel: List<DocumentFile>, idIn: String, nameIn: String,
+        withHeader: Boolean, makeVmcFile: Boolean, multi: Boolean, share: Boolean
+    ) {
+        val dir = tree ?: throw Exception("Sem pasta")
+        if (!multi) {
+            val name = sanitize(nameIn, 20)
+            val base = convertOne(sel[0], idIn, name, withHeader) { p -> runOnUiThread { bar.progress = p } }
+            if (makeVmcFile) putSlots(ensureFolder(dir, base), base)
+            return
+        }
+        if (sel.size < 2) throw Exception("Marque pelo menos 2 discos.")
+        if (sel.size > 4) throw Exception("O POPStarter troca no máximo 4 discos.")
+        val gname = sanitize(nameIn, 16)
+        val bases = ArrayList<String>()
+        for ((i, c) in sel.withIndex()) {
+            log("--- Disco ${i + 1}: ${c.name} ---")
+            bases.add(
+                convertOne(c, "", "${gname}_CD${i + 1}", withHeader) { p ->
+                    runOnUiThread { bar.progress = (i * 100 + p) / sel.size }
+                }
+            )
+        }
+        val list = bases.joinToString("\r\n") { "$it.VCD" }
+        for ((i, b) in bases.withIndex()) {
+            val sub = ensureFolder(dir, b)
+            writeText(sub, "DISCS.TXT", list)
+            if (share) writeText(sub, "VMCDIR.TXT", bases[0])
+            if (makeVmcFile && (!share || i == 0)) putSlots(sub, b)
+        }
+        log("DISCS.TXT criado em cada pasta de disco.")
+    }
+
+    private fun convertOne(
+        cue: DocumentFile, idIn: String, name: String, withHeader: Boolean, prog: (Int) -> Unit
+    ): String {
+        val dir = tree ?: throw Exception("Sem pasta")
+        val text = (contentResolver.openInputStream(cue.uri) ?: throw Exception("Não abri o CUE"))
+            .use { it.readBytes().toString(Charsets.UTF_8) }.removePrefix("\uFEFF")
+        val (files, tracks) = parseCue(text)
+        val all = dir.listFiles()
+        val bins = files.map { n ->
+            val base = n.substringAfterLast('/').substringAfterLast('\\')
+            all.firstOrNull { it.isFile && it.name.equals(base, true) } ?: throw Exception("BIN não encontrado: $base")
+        }
+        val starts = LongArray(bins.size)
+        var total = 0L
+        for ((i, b) in bins.withIndex()) {
+            if (b.length() % 2352L != 0L) throw Exception("${b.name}: tamanho não é múltiplo de 2352 (não é imagem RAW)")
+            starts[i] = total
+            total += b.length() / 2352L
+        }
+        log("${tracks.size} trilha(s), ${bins.size} arquivo(s) BIN, $total setores.")
+
+        var id = idIn.uppercase()
+        if (id.isEmpty()) {
+            log("Detectando ID do jogo...")
+            id = detectId(bins[0]) ?: throw Exception("Não consegui detectar o ID. Digite manualmente (ex: SLUS_007.76).")
+            log("ID: $id")
+        }
+        val baseName = "$id.$name"
+        val outName = "$baseName.VCD"
+
+        val hdr = ByteArray(0x100000)
+        if (withHeader) {
+            val first = tracks.first()
+            val last = tracks.last()
+            fun ctl(t: TrackInfo): Byte = if (t.audio) 0x01 else 0x41
+            var o = 0
+            hdr[o] = ctl(first); hdr[o + 2] = 0xA0.toByte(); hdr[o + 7] = bcd(first.number); hdr[o + 8] = 0x20; o += 10
+            hdr[o] = ctl(last); hdr[o + 2] = 0xA1.toByte(); hdr[o + 7] = bcd(last.number); o += 10
+            hdr[o] = ctl(last); hdr[o + 2] = 0xA2.toByte(); putMsf(hdr, o + 7, total); o += 10
+            for ((k, t) in tracks.withIndex()) {
+                hdr[o] = ctl(t); hdr[o + 2] = bcd(t.number)
+                val abs1 = starts[t.fileIdx] + t.idx1
+                val abs0 = if (k == 0) -150L else if (t.idx0 >= 0) starts[t.fileIdx] + t.idx0 else abs1
+                putMsf(hdr, o + 3, abs0)
+                putMsf(hdr, o + 7, abs1)
+                o += 10
+            }
+            hdr[0x400] = 0x6B; hdr[0x401] = 0x48; hdr[0x402] = 0x6E; hdr[0x403] = 0x22
+            putLe32(hdr, 0x408, total)
+            putLe32(hdr, 0x40C, total)
+        } else {
+            log("Aviso: sem cabeçalho o POPStarter não reconhece o VCD.")
+        }
+
+        log("Gravando $outName ...")
+        val out = createOut(dir, outName)
+        val totalBytes = bins.sumOf { it.length() }
+        var done = 0L
+        var lastPct = -1
+        BufferedOutputStream(
+            contentResolver.openOutputStream(out.uri, "w") ?: throw Exception("Não abri a saída"), 1 shl 20
+        ).use { os ->
+            if (withHeader) os.write(hdr)
+            val buf = ByteArray(1 shl 20)
+            for (b in bins) {
+                (contentResolver.openInputStream(b.uri) ?: throw Exception("Não abri ${b.name}")).use { ins ->
+                    while (true) {
+                        val n = ins.read(buf)
+                        if (n < 0) break
+                        os.write(buf, 0, n)
+                        done += n
+                        val pct = (done * 100 / totalBytes).toInt()
+                        if (pct != lastPct) { lastPct = pct; prog(pct) }
+                    }
+                }
+            }
+        }
+        log("VCD pronto.")
+        return baseName
+    }
 }
